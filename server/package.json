@@ -17,7 +17,7 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "mysql2": "^3.14.1",
-    "redis": "^5.6.0"
+    "redis": "^5.12.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"

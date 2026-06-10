@@ -1,29 +1,30 @@
+const { createClient } = require('redis');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const mysql = require('mysql2/promise');
-
+const mysql = require('mysql2/promise'); // 1. Importamos mysql2/promise
 const app = express();
 const PORT = 3000;
-const redis = require('redis');
 
-const redisClient = redis.createClient();
+const client = createClient({
+    socket: {
+        host: '127.0.0.1',
+        port: 6379
+    }
+});
 
-redisClient.connect().then(() => {
-    console.log("Conectado a Redis");
-}).catch(console.error);
-
-// 2. Configuramos la conexión a la base de datos MySQL
-// Usamos createPool para manejar múltiples conexiones eficientemente
+// --- 2. Configuración de la Conexión a la Base de Datos ---
+// Crea un "pool" de conexiones, que es más eficiente que una única conexión.
 const pool = mysql.createPool({
-    host: 'localhost',        
-    user: 'root',       
-    password: '',   
-    database: 'shop', 
+    host: 'localhost',          // O la IP de tu servidor de BD
+    user: 'root',         // Tu usuario de MySQL
+    password: '',    // Tu contraseña de MySQL
+    database: 'shop', // El nombre de tu base de datos
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 });
+
 
 // Construct the absolute path to client's public folder
 const clientPublicPath = path.join(__dirname, '..', 'client', 'public');
@@ -41,32 +42,48 @@ app.use(express.json());
 
 // Middleware to handle CORS
 app.use(cors(corsOptions));
+// Al inicio, FUERA de cualquier ruta:
+client.connect().catch(console.error);
 
-// --- 3. Modificamos la ruta /api/products ---
-app.get('/api/products', async (req, res) => { // función asíncrona
+// La ruta corregida:
+app.get('/api/products', async (req, res) => {
+        
     try {
-        // Obtenemos una conexión del pool
-        const connection = await pool.getConnection(); 
-        // Ejecutamos la consulta para obtener todos los productos de la tabla 'stock'
-        const [rows] = await connection.query(`SELECT 
+        // Redis v4 usa promesas, sin callback
+        const cachedProducts = await client.get('products');
+        if (cachedProducts) {
+            console.log('Productos obtenidos de Redis');
+            return res.json(JSON.parse(cachedProducts));
+        }
+        console.log('🗄️ Productos obtenidos desde MySQL');
+        const connection = await pool.getConnection();
+        const [rows] = await connection.query(`
+            SELECT 
                 p.product_id AS id,
                 p.name,
                 p.price,
                 p.image_url AS image,
                 s.quantity AS stock
-                FROM products p
-                JOIN stock s ON p.product_id = s.product_id
-                WHERE p.is_active = 1`);
-        connection.release(); 
+            FROM products p
+            JOIN stock s ON p.product_id = s.product_id
+            WHERE p.is_active = 1
+        `);
+        connection.release();
+
+        await client.set('products', JSON.stringify(rows), { EX: 3600 });
+
         res.json(rows);
 
     } catch (error) {
-        console.error('Error al obtener los productos de la base de datos:', error);
+        console.error('Error al obtener los productos:', error);
         res.status(500).json({ error: 'Error interno del servidor al consultar los productos.' });
     }
+
+    
+    
 });
 app.post('/api/checkout', async (req, res) => {
-    const cartItems = req.body; // [{ id: 1, quantity: 2 }, { id: 3, quantity: 1 }, ...]
+    const cartItems = req.body;
 
     if (!Array.isArray(cartItems) || cartItems.length === 0) {
         return res.status(400).json({ message: 'Carrito vacío o malformado' });
@@ -75,7 +92,7 @@ app.post('/api/checkout', async (req, res) => {
     const connection = await pool.getConnection();
 
     try {
-        await connection.beginTransaction(); // Transacción para asegurar atomicidad
+        await connection.beginTransaction();
 
         const updatedStocks = [];
 
@@ -85,17 +102,11 @@ app.post('/api/checkout', async (req, res) => {
                 [item.id]
             );
 
-            if (rows.length === 0) {
-                throw new Error(`Producto con ID ${item.id} no encontrado`);
-            }
+            if (rows.length === 0) throw new Error(`Producto con ID ${item.id} no encontrado`);
 
             const currentStock = rows[0].quantity;
+            if (currentStock < item.quantity) throw new Error(`Stock insuficiente para el producto ${item.id}`);
 
-            if (currentStock < item.quantity) {
-                throw new Error(`Stock insuficiente para el producto ${item.id}`);
-            }
-
-            // Actualizamos stock
             const newStock = currentStock - item.quantity;
             await connection.query(
                 `UPDATE stock SET quantity = ? WHERE product_id = ?`,
@@ -105,8 +116,12 @@ app.post('/api/checkout', async (req, res) => {
             updatedStocks.push({ id: item.id, stock: newStock });
         }
 
-        await connection.commit(); 
-        res.json(updatedStocks);   
+        await connection.commit();
+
+        // ✅ Invalidamos la cache para que el próximo GET traiga datos frescos
+        await client.del('products');
+
+        res.json(updatedStocks);
 
     } catch (error) {
         await connection.rollback();
