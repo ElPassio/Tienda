@@ -1,10 +1,96 @@
 const { createClient } = require('redis');
 const path = require('path');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const express = require('express');
 const cors = require('cors');
 const mysql = require('mysql2/promise'); // 1. Importamos mysql2/promise
 const app = express();
 const PORT = 3000;
+
+
+const JWT_SECRET = process.env.JWT_SECRET || 'clave_secreta';
+
+app.post('/api/register', async (req, res) => {
+    const {first_name, last_name, email, password, phone_number} = req.body;
+
+    if (!first_name || !last_name || !email || !password || !phone_number) {
+        return res.status(400).json({ message: 'Todos los campos son obligatorios' });
+    }
+    const connection = await pool.getConnection();
+    try{
+        const [existing] = await connection.query(
+            'SELECT user_id FROM users WHERE email = ?', [email]
+        );
+        if (existing.length > 0) {
+            return res.status(400).json({ message: 'El correo ya está registrado' });
+        }
+
+        const password_hash = await bcrypt.hash(password, 10);
+
+        const result = await connection.query(
+            'INSERT INTO users (first_name, last_name, email, password_hash, phone_number) VALUES (?, ?, ?, ?, ?)',
+            [first_name, last_name, email, password_hash, phone_number || null ]
+        );
+        // Generamos el token JWT con el user_id recién creado
+        // El result de un INSERT con mysql2/promise devuelve un objeto con insertId
+        const token = jwt.sign({ userId: result.insertId, email }, JWT_SECRET, { expiresIn: '7d' }
+    );
+
+        res.status(201).json({ user: {id : result.insertId, first_name, last_name, email}, token });
+    }catch(err){
+        console.error('Error en /api/register:', err);
+        res.status(500).json({ message: 'Error interno del servidor' });
+    }finally{
+        connection.release();
+    }
+});
+
+app.post('/api/login', async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password){
+        return res.status(400).json({error: 'email y contraseña requeridos'});
+    }
+
+    const connection = await pool.getConnection();
+    try{
+        const [rows] = await connection.query(
+            'SELECT * FROM users WHERE email = ? AND is_active = 1', [email]
+        );
+        if (rows.length == 0){
+            return res.status(401).json({error: 'Credenciales invalidas'})
+        }
+        const user = rows[0]
+        const isvalid = await bcrypt.compare(password, user.password_hash);
+        if (!isvalid){
+            return res.status(401).json({error: 'Credenciales invalidas'})
+        }
+
+        await connection.query(
+            'UPDATE users SET last_login = NOW() WHERE user_id = ?', [user.user_id]
+        );
+        const token = jwt.sign(
+            { userId: user.user_id, email: user.email },
+            JWT_SECRET,
+            { expiresIn: '7d'}
+        );
+
+        res.json({
+            token,
+            user: {
+                id: user.user_id,
+                first_name: user.first_name,
+                last_name: user.last_name,
+                email: user.email
+            }
+        });
+    }catch(err){
+        console.log('error en el login')
+        res.status(500).json({error: 'Error interno del servidor'})
+    }finally{
+        connection.release();
+    }
+});
 
 const client = createClient({
     socket: {
